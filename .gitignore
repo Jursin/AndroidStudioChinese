@@ -1,0 +1,7 @@
+upstream/
+dist/
+stubs/
+build/
+__pycache__/
+*.pyc
+*.bak

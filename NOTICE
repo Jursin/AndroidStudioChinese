@@ -1,0 +1,18 @@
+Copyright 2026 YuKongA
+
+This product bundles the Simplified Chinese translations taken from the JetBrains
+language pack "Chinese (Simplified) Language Pack / 中文语言包" (plugin id com.intellij.zh),
+which JetBrains ships inside IntelliJ IDEA and which is distributed under the Apache
+License 2.0 together with the JetBrains Open Source Build Terms
+(https://github.com/JetBrains/intellij-community/blob/master/LICENSE.txt).
+
+Modifications made by this project before redistribution:
+
+  - merged additional translations from translations/ over the upstream bundles;
+  - exported part of them as messages/*_zh_CN.properties for the boot class path;
+  - added an applicationInitializedListener to plugin.xml that relabels actions by id;
+  - relaxed idea-version to AI-0 / AI-999.* and dropped the build-time __index__ entry.
+
+IntelliJ, Android Studio, JetBrains, Gradle, Kotlin and Java are trademarks of their
+respective owners. This project is not affiliated with, endorsed by, or sponsored by
+JetBrains s.r.o. or Google LLC; the artifacts it produces are unofficial builds.

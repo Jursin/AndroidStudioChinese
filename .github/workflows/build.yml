@@ -1,0 +1,168 @@
+name: build
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    paths:
+      - "scripts/**"
+      - "plugin/**"
+      - "translations/**"
+      - ".github/workflows/build.yml"
+  workflow_dispatch:
+    inputs:
+      as_url:
+        description: Android Studio 下载地址（留空取当前稳定版）
+        required: false
+      publish:
+        description: 发布并覆盖 pre-release
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    outputs:
+      platform: ${{ steps.platform.outputs.value }}
+      pack: ${{ steps.meta.outputs.pack }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Resolve Android Studio download url
+        id: as
+        run: |
+          url="${{ inputs.as_url }}"
+          if [ -z "$url" ]; then
+            url=$(curl -fsSL https://developer.android.com/studio \
+                  | grep -oE 'https://[^"]*/ide-zips/[^"]*/[^"]*linux\.tar\.gz' | head -1)
+          fi
+          if [ -z "$url" ]; then
+            echo "无法解析 Android Studio 下载地址，请通过 as_url 显式指定" >&2
+            exit 1
+          fi
+          version=$(echo "$url" | sed -E 's#.*/ide-zips/([^/]+)/.*#\1#')
+          echo "url=$url" >> "$GITHUB_OUTPUT"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "Android Studio: $version ($url)"
+
+      - name: Install Android Studio
+        run: |
+          curl -fL --retry 3 "${{ steps.as.outputs.url }}" -o "$RUNNER_TEMP/android-studio.tar.gz"
+          mkdir -p "$RUNNER_TEMP/as"
+          tar -xzf "$RUNNER_TEMP/android-studio.tar.gz" -C "$RUNNER_TEMP/as" --strip-components=1
+          echo "AS_HOME=$RUNNER_TEMP/as" >> "$GITHUB_ENV"
+          "$RUNNER_TEMP/as/jbr/bin/javac" -version
+
+      - name: Resolve platform build
+        id: platform
+        run: |
+          platform=$(python3 -c "import json,os;print(json.load(open(os.environ['AS_HOME'] + '/product-info.json'))['buildNumber'].split('.')[0])")
+          echo "value=$platform" >> "$GITHUB_OUTPUT"
+          echo "platform build: $platform"
+
+      - name: Fetch upstream language pack
+        run: |
+          python3 scripts/zhpack.py fetch --for-version "${{ steps.as.outputs.version }}" \
+            --expect-build "${{ steps.platform.outputs.value }}" \
+            --out upstream/localization-zh.jar
+
+      - name: Build
+        run: |
+          python3 scripts/zhpack.py build-all \
+            --ide-home "$AS_HOME" \
+            --upstream upstream/localization-zh.jar \
+            --out "dist/zh-as-${{ steps.platform.outputs.value }}.jar"
+
+      - name: Verify
+        run: |
+          python3 - "${{ steps.platform.outputs.value }}" <<'PY'
+          import sys, zipfile
+
+          platform = sys.argv[1]
+          plugin_path = f"dist/zh-as-{platform}.jar"
+          native_path = f"dist/zh-native-{platform}.jar"
+
+          plugin = zipfile.ZipFile(plugin_path)
+          assert plugin.testzip() is None, plugin_path
+          names = plugin.namelist()
+          xml = plugin.read("META-INF/plugin.xml").decode()
+          assert "<languageBundle" in xml, "languageBundle missing"
+          assert "<applicationInitializedListener" in xml, "action overlay EP missing"
+          assert "aszh/ActionTextOverlay.class" in names
+          assert "actions.properties" in names
+          assert "META-INF/LICENSE" in names and "META-INF/NOTICE" in names
+          assert "AndroidStudioChinese" in xml.split("<vendor>")[1].split("</vendor>")[0]
+          assert not any(n.endswith("_zh_CN.properties") for n in names), "native entries must not be in the plugin jar"
+
+          native = zipfile.ZipFile(native_path)
+          assert native.testzip() is None, native_path
+          assert native.namelist() and all(n.endswith("_zh_CN.properties") for n in native.namelist())
+
+          print(f"plugin {plugin_path}: {len(names)} entries")
+          print(f"native {native_path}: {len(native.namelist())} entries")
+          PY
+          ls -l dist
+
+      - name: Resolve language pack version
+        id: meta
+        run: |
+          pack=$(python3 -c "import re,sys,zipfile; xml=zipfile.ZipFile(sys.argv[1]).read('META-INF/plugin.xml').decode(); print(re.search(r'<version>(.*?)</version>', xml).group(1))" "dist/zh-as-${{ steps.platform.outputs.value }}.jar")
+          echo "pack=$pack" >> "$GITHUB_OUTPUT"
+          echo "language pack: $pack"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: zh-jars
+          path: dist/*.jar
+          if-no-files-found: error
+
+  release:
+    needs: build
+    if: |
+      (github.event_name == 'push' && github.ref == 'refs/heads/main') ||
+      (github.event_name == 'workflow_dispatch' && inputs.publish)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: zh-jars
+          path: dist
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          tag_name: prerelease
+          name: pre-release
+          prerelease: true
+          make_latest: "false"
+          overwrite_files: true
+          fail_on_unmatched_files: true
+          files: |
+            dist/*.jar
+            LICENSE
+            NOTICE
+          body: |
+            - 平台构建号：`${{ needs.build.outputs.platform }}`
+            - 语言包版本：`${{ needs.build.outputs.pack }}`
+            - 提交：`${{ github.sha }}`
+
+            安装（先在 Settings → Plugins 卸载其他中文语言包）：
+
+            ```bash
+            python3 scripts/zhpack.py install-pack   --jar zh-as-${{ needs.build.outputs.platform }}.jar --ide-home <AS>
+            python3 scripts/zhpack.py install-native --jar zh-native-${{ needs.build.outputs.platform }}.jar
+            ```
