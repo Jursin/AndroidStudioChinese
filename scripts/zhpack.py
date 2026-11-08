@@ -52,6 +52,8 @@ MARK_END = "# <<< AndroidStudioChinese native overlay <<<"
 MARKETPLACE_PLUGIN = 13710
 LOCALE_SUFFIX = re.compile(r"_[a-z]{2,3}(?:_[A-Z]{2})?$")
 UA = {"User-Agent": "AndroidStudioChinese/1.0"}
+IS_WIN = os.name == "nt"
+IS_MAC = sys.platform == "darwin"
 
 
 # --------------------------------------------------------------------------- io
@@ -334,7 +336,7 @@ def cmd_fetch(args) -> int:
 
 
 def cmd_audit(args) -> int:
-    ide_home = Path(args.ide_home)
+    ide_home = resolve_ide_home(args.ide_home)
     bundles = collect_bundles(ide_home)
     up = zipfile.ZipFile(args.pack) if args.pack else None
     ov = overlay(Path(args.translations))
@@ -438,12 +440,74 @@ def patch_plugin_xml(xml: str, args) -> str:
 # ---------------------------------------------------------- install / helpers
 
 
+def config_base() -> Path:
+    """Per-user IDE config directory: %APPDATA% / Application Support / ~/.config."""
+    if IS_WIN:
+        return Path(os.environ.get("APPDATA") or (Path.home() / "AppData/Roaming"))
+    if IS_MAC:
+        return Path.home() / "Library/Application Support"
+    return Path(os.environ.get("XDG_CONFIG_HOME") or (Path.home() / ".config"))
+
+
+def ide_candidates() -> list[Path]:
+    """Usual Android Studio install locations for this platform."""
+    out: list[Path] = []
+    if IS_WIN:
+        try:
+            import winreg
+
+            for root in (winreg.HKEY_LOCAL_MACHINE, winreg.HKEY_CURRENT_USER):
+                try:
+                    with winreg.OpenKey(root, r"SOFTWARE\Android Studio") as key:
+                        out.append(Path(winreg.QueryValueEx(key, "Path")[0]))
+                except OSError:
+                    pass
+        except ImportError:
+            pass
+        for env, sub in (("ProgramFiles", "Android/Android Studio"),
+                         ("ProgramW6432", "Android/Android Studio"),
+                         ("LOCALAPPDATA", "Programs/Android Studio")):
+            if os.environ.get(env):
+                out.append(Path(os.environ[env]) / sub)
+        toolbox = Path(os.environ.get("LOCALAPPDATA") or (Path.home() / "AppData/Local")) / "JetBrains/Toolbox/apps"
+    elif IS_MAC:
+        out += [p.parent for p in Path("/Applications").glob("Android Studio*.app/Contents")]
+        toolbox = Path.home() / "Library/Application Support/JetBrains/Toolbox/apps"
+    else:
+        out += [Path("/opt/android-studio"), Path("/usr/local/android-studio")]
+        toolbox = Path.home() / ".local/share/JetBrains/Toolbox/apps"
+    return out + [p.parent for p in toolbox.glob("*/ch-*/*/product-info.json")]
+
+
+def detect_ide_home() -> Path | None:
+    """Newest installed Android Studio, or None."""
+
+    def rank(home: Path) -> tuple[int, ...]:
+        info = json.loads((home / "product-info.json").read_text(encoding="utf-8"))
+        return tuple(int(n) for n in re.findall(r"\d+", str(info.get("buildNumber") or "")))
+
+    homes = {p.resolve() for p in ide_candidates() if (p / "product-info.json").is_file()}
+    return max(homes, key=rank) if homes else None
+
+
+def resolve_ide_home(value: str | None) -> Path:
+    if value:
+        return Path(value).expanduser()
+    home = detect_ide_home()
+    if home is None:
+        raise SystemExit("cannot find Android Studio - pass --ide-home")
+    print(f"ide-home : {home} (auto-detected)", file=sys.stderr)
+    return home
+
+
 def plugins_dir(ide_home: Path) -> Path:
     info = json.loads((ide_home / "product-info.json").read_text(encoding="utf-8"))
     vendor = info.get("productVendor") or "JetBrains"
     data = info.get("dataDirectoryName") or ide_home.name
-    base = Path(os.environ.get("XDG_DATA_HOME") or (Path.home() / ".local/share"))
-    return base / vendor / data
+    # Windows and macOS keep user plugins under the config dir, Linux under its data dir
+    if IS_WIN or IS_MAC:
+        return config_base() / vendor / data / "plugins"
+    return Path(os.environ.get("XDG_DATA_HOME") or (Path.home() / ".local/share")) / vendor / data
 
 
 def plugin_id_of(jar: Path) -> str | None:
@@ -468,7 +532,7 @@ def cmd_install_pack(args) -> int:
     plugin_id = plugin_id_of(jar)
     if plugin_id is None:
         raise SystemExit(f"{jar}: no META-INF/plugin.xml with <id>")
-    target = Path(args.plugins_dir) if args.plugins_dir else plugins_dir(Path(args.ide_home))
+    target = Path(args.plugins_dir) if args.plugins_dir else plugins_dir(resolve_ide_home(args.ide_home))
     if not target.is_dir():
         raise SystemExit(f"plugins directory not found: {target}")
 
@@ -502,7 +566,7 @@ def cmd_install_pack(args) -> int:
 
 def cmd_locate(args) -> int:
     """Where does a given UI string actually live?"""
-    ide_home = Path(args.ide_home)
+    ide_home = resolve_ide_home(args.ide_home)
     up = zipfile.ZipFile(args.pack) if args.pack else None
     ov = overlay(Path(args.translations))
     needles = args.strings
@@ -585,7 +649,7 @@ def extract_actions(ide_home: Path) -> dict[str, tuple[str | None, str]]:
 
 
 def cmd_audit_actions(args) -> int:
-    actions = extract_actions(Path(args.ide_home))
+    actions = extract_actions(resolve_ide_home(args.ide_home))
     known = load_action_translations(Path(args.translations))
     with_text = {k: v for k, v in actions.items() if v[0]}
     print(f"action ids registered: {len(actions)}   with inline text: {len(with_text)}"
@@ -623,9 +687,10 @@ def compile_action_classes(ide: Path, source: Path | None, classes: Path) -> dic
     shutil.rmtree(classes, ignore_errors=True)
     classes.mkdir(parents=True, exist_ok=True)
 
-    javac = ide / "jbr/bin/javac"
-    if not javac.is_file():
-        raise SystemExit(f"no javac at {javac}")
+    jbr = ide / "jbr/bin"
+    javac = next((p for p in (jbr / "javac", jbr / "javac.exe") if p.is_file()), None)
+    if javac is None:
+        raise SystemExit(f"no javac under {jbr}")
     classpath = os.pathsep.join(str(p) for p in sorted((ide / "lib").glob("*.jar")))
     subprocess.run([str(javac), "-encoding", "UTF-8", "-nowarn", "-d", str(classes),
                     "-cp", classpath, str(source)], check=True)
@@ -645,7 +710,7 @@ def cmd_build_all(args) -> int:
     referenced from -Xbootclasspath/a: is classified as a bundled plugin and gets no
     class loader ("jarFiles is not set"), which silently disables the language pack.
     """
-    ide = Path(args.ide_home)
+    ide = resolve_ide_home(args.ide_home)
     upstream = zipfile.ZipFile(args.upstream)
     ov = overlay(Path(args.translations))
     entries: dict[str, bytes] = {
@@ -683,7 +748,7 @@ def cmd_build_all(args) -> int:
     native_entries: dict[str, bytes] = {}
     bundles = collect_bundles(ide)
     for name in sorted(bundles):
-        if not any("/plugins/" in str(j) for j in bundles[name]["jars"]):
+        if not any("plugins" in j.parts for j in bundles[name]["jars"]):
             continue
         content = combined(name, ov, upstream)
         if content.strip():
@@ -702,22 +767,44 @@ def cmd_build_all(args) -> int:
     print(f"  entries    : {len(entries)}  actions: {len(translations)}")
     print(f"native jar -> {native_out}")
     print(f"  entries    : {len(native_entries)}  ({args.locale})")
-    print("  install    : install-pack --jar <plugin jar> --ide-home <AS>; "
-          "install-native --jar <native jar>")
+    print("  install    : install-pack --jar <plugin jar>; install-native --jar <native jar>")
     return 0
 
 
-def default_vmoptions() -> Path | None:
+def default_vmoptions(seed: bool = True) -> Path | None:
+    """User vmoptions of the newest IDE; seeded from the install defaults if absent."""
+    ide = detect_ide_home()
+    defaults = sorted((ide / "bin").glob("studio*.vmoptions")) if ide else []
+    name = defaults[0].name if defaults else "studio*.vmoptions"  # e.g. studio64.exe.vmoptions on Windows
     cands = sorted(
-        Path.home().glob(".config/Google/AndroidStudio*/studio64.vmoptions"),
+        config_base().glob(f"*/AndroidStudio*/{name}"),
         key=lambda p: p.stat().st_mtime,
     )
-    return cands[-1] if cands else None
+    if cands:
+        return cands[-1]
+    if not defaults:
+        return None
+    info = json.loads((ide / "product-info.json").read_text(encoding="utf-8"))
+    target = (config_base() / (info.get("productVendor") or "Google")
+              / (info.get("dataDirectoryName") or ide.name) / name)
+    if seed:
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(defaults[0], target)
+        print(f"seeded   -> {target}  (copy of {name})")
+    return target
+
+
+def default_native_dir() -> Path:
+    return (Path(os.environ.get("LOCALAPPDATA") or Path.home() / "AppData/Local") if IS_WIN
+            else Path.home() / ".local/share") / "android-studio-zh-native"
 
 
 def vm_block(jar: Path, locale: str) -> list[str]:
     lang, _, country = locale.partition("_")
-    block = [MARK_BEGIN, f"-Xbootclasspath/a:{jar}", f"-Duser.language={lang}"]
+    path = jar.as_posix()  # forward slashes keep the option readable on Windows
+    if " " in path:
+        path = f'"{path}"'  # the launcher splits options on whitespace
+    block = [MARK_BEGIN, f"-Xbootclasspath/a:{path}", f"-Duser.language={lang}"]
     if country:
         block.append(f"-Duser.country={country}")
     block.append(MARK_END)
@@ -728,15 +815,16 @@ def cmd_install_native(args) -> int:
     jar = Path(args.jar).resolve()
     if not jar.is_file():
         raise SystemExit(f"missing overlay jar: {jar}")
-    vm = Path(args.vmoptions).resolve() if args.vmoptions else default_vmoptions()
-    if vm is None or not vm.is_file():
+    vm = Path(args.vmoptions).resolve() if args.vmoptions else \
+        default_vmoptions(seed=not (args.print_only or args.remove))
+    if vm is None or (not vm.is_file() and not args.print_only):
         raise SystemExit("cannot find studio64.vmoptions - pass --vmoptions")
 
-    dest_dir = Path(args.dest) if args.dest else Path.home() / ".local/share/android-studio-zh-native"
+    dest_dir = Path(args.dest) if args.dest else default_native_dir()
     dest_dir.mkdir(parents=True, exist_ok=True)
     dest = dest_dir / jar.name
 
-    text = vm.read_text(encoding="utf-8")
+    text = vm.read_text(encoding="utf-8") if vm.is_file() else ""
     keep: list[str] = []
     skipping = False
     for line in text.splitlines():
@@ -806,7 +894,7 @@ def main(argv: list[str] | None = None) -> int:
     f.set_defaults(func=cmd_fetch)
 
     a = sub.add_parser("audit", help="translation coverage report")
-    a.add_argument("--ide-home", required=True)
+    a.add_argument("--ide-home", help="IDE install (default: auto-detect)")
     a.add_argument("--pack", help="upstream language pack jar")
     a.add_argument("--translations", default="translations")
     a.add_argument("--top", type=int, default=30)
@@ -816,14 +904,14 @@ def main(argv: list[str] | None = None) -> int:
     a.set_defaults(func=cmd_audit)
 
     aa = sub.add_parser("audit-actions", help="list action ids and their inline English texts")
-    aa.add_argument("--ide-home", required=True)
+    aa.add_argument("--ide-home", help="IDE install (default: auto-detect)")
     aa.add_argument("--translations", default="translations")
     aa.add_argument("--top", type=int, default=40)
     aa.add_argument("--out")
     aa.set_defaults(func=cmd_audit_actions)
 
     ba = sub.add_parser("build-all", help="one jar: language pack + native resources + action overlay")
-    ba.add_argument("--ide-home", required=True)
+    ba.add_argument("--ide-home", help="IDE install (default: auto-detect)")
     ba.add_argument("--upstream", required=True)
     ba.add_argument("--translations", default="translations")
     ba.add_argument("--locale", default="zh_CN")
@@ -840,7 +928,7 @@ def main(argv: list[str] | None = None) -> int:
     ba.set_defaults(func=cmd_build_all)
 
     loc = sub.add_parser("locate", help="find where a UI string lives (bundle / plugin.xml / hardcoded)")
-    loc.add_argument("--ide-home", required=True)
+    loc.add_argument("--ide-home", help="IDE install (default: auto-detect)")
     loc.add_argument("--pack")
     loc.add_argument("--translations", default="translations")
     loc.add_argument("strings", nargs="+")
@@ -848,7 +936,7 @@ def main(argv: list[str] | None = None) -> int:
 
     p_inst = sub.add_parser("install-pack", help="copy the language pack into the plugins directory")
     p_inst.add_argument("--jar", required=True)
-    p_inst.add_argument("--ide-home")
+    p_inst.add_argument("--ide-home", help="IDE install (default: auto-detect)")
     p_inst.add_argument("--plugins-dir")
     p_inst.add_argument("--remove", action="store_true")
     p_inst.add_argument("--print-only", action="store_true")

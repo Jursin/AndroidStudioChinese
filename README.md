@@ -20,28 +20,25 @@
 
 语言包按 AS 版本自动匹配：AS `2026.2.2.9` → IDEA `2026.2`（平台构建号 `262`，即 AS `product-info.json` 里 `buildNumber` 的前三位）
 
-```bash
-AS=~/.local/share/JetBrains/Toolbox/apps/android-studio
-PD=~/.local/share/Google/AndroidStudio2026.2.2         # AS 插件目录，重启后生效
+`--ide-home` 手动指定安装目录，多个安装取 `buildNumber` 最新的一个
 
-python3 scripts/zhpack.py fetch --for-version 2026.2 \
-    --out upstream/localization-zh-262.jar
-python3 scripts/zhpack.py build-all --ide-home $AS \
-    --upstream upstream/localization-zh-262.jar --out dist/zh-as-262.jar
-python3 scripts/zhpack.py install-pack   --jar dist/zh-as-262.jar    --ide-home $AS
+```bash
+python3 scripts/zhpack.py fetch --for-version 2026.2 --out upstream/localization-zh-262.jar
+python3 scripts/zhpack.py build-all --upstream upstream/localization-zh-262.jar --out dist/zh-as-262.jar
+python3 scripts/zhpack.py install-pack   --jar dist/zh-as-262.jar
 python3 scripts/zhpack.py install-native --jar dist/zh-native-262.jar
 ```
 
 `build-all` 同时产出 `dist/zh-as-262.jar`（插件）与 `dist/zh-native-262.jar`（资源），后者由 `install-native` 复制到插件目录之外并写入 vmoptions
 
 重启 AS，在 `Settings → Appearance & Behavior → System Settings → Language and Region` 中选择 `Chinese`
-回滚方式：执行 `install-native --remove`，并删除 `$PD/zh-as-262.jar`
+回滚方式：执行 `install-native --remove`，并删除插件目录下的 `zh-as-262.jar`
 
 ## 翻译维护
 
 - 文案：`translations/messages/<Bundle>.properties`，仅写入需要覆盖的键
 - 动作：`translations/actions.properties`，格式为 `actionId=中文`
-- 定位：`python3 scripts/zhpack.py locate --ide-home $AS "目标字符串"`
+- 定位：`python3 scripts/zhpack.py locate "目标字符串"`
 - 专有名词（Gradle / Java / Kotlin / AGP / SDK / JVM / Compose / Activity / APK）保留原文；build=构建、clean=清理
 - 修改后重新执行 `build-all` 与两条 `install-*` 命令
 
@@ -55,8 +52,9 @@ python3 scripts/zhpack.py install-native --jar dist/zh-native-262.jar
 ## 注意事项
 
 - 同一 `zh-CN` 仅允许一个语言包生效，需先卸载其他中文语言包
-- AS 升级后重新执行 `build-all` 与 `install-*`；`PD` 路径与版本号需同步更新
+- AS 升级后重新执行 `build-all` 与 `install-*`；版本号与示例中的 `2026.2` / `262` 需同步更新（安装目录与插件目录由脚本探测）
 - vmoptions 中该行指向插件目录外的资源 jar；文件不存在时 JVM 会忽略该条目，不影响 IDE 启动
+- 用户级 vmoptions（Windows 为 `studio64.exe.vmoptions`）不存在时，`install-native` 从安装目录 `bin/studio*.vmoptions` 复制默认值再追加，等价于 `Help → Edit Custom VM Options`
 - `-Duser.language=zh` 影响依赖默认 locale 的格式化行为，如不需要可移除对应两行
 - 无法通过资源文件覆盖：由 `update()` 动态拼接的文本（如 `Assemble 'xxx' Run Configuration`）及未注册 id 的动作
 - 当前覆盖率：353 个 bundle / 48 342 键，已覆盖 93.5%（缺 3 140）；动作 33 条
